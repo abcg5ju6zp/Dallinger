@@ -105,6 +105,9 @@
 
 ### Fixed
 
+- Fixed an intermittent failure of the ``docker debug`` CI test without
+  bots. With ``--verbose``, each recruitment URL is printed twice, and the
+  test sometimes sent its second bot to the first participant's URL.
 - Bots with a ``webdriver_url`` start again. They passed
   ``desired_capabilities``, which Selenium 4.10 removed, and now pass the
   same browser options as local bots.
