@@ -19,7 +19,7 @@ from pytest import raises
 
 from dallinger import recruiters
 from dallinger.config import get_config
-from tests.helpers import write_deployment_policy
+from tests.helpers import write_deployment_policy, write_files
 
 
 def found_in(name, path):
@@ -815,6 +815,97 @@ class TestExperimentFilesSource:
 
         assert not (destination / "asset.txt").exists()
 
+    def test_plan_copy_terminates_generation_when_content_changed_after_planning(
+        self, subject, tmp_path
+    ):
+        from dallinger.deployment_plan import DeploymentGenerationError
+
+        root = tmp_path / "experiment"
+        root.mkdir()
+        (root / "asset.txt").write_text("planned")
+        write_deployment_policy(root)
+        source = subject(root)
+        destination = tmp_path / "destination"
+
+        (root / "asset.txt").write_text("edited after deployment started")
+
+        with pytest.raises(DeploymentGenerationError, match="content changed"):
+            source.apply_to(destination)
+        assert not (destination / "asset.txt").exists()
+
+    def test_plan_copy_terminates_generation_when_file_appears_after_planning(
+        self, subject, tmp_path
+    ):
+        from dallinger.deployment_plan import DeploymentGenerationError
+
+        root = tmp_path / "experiment"
+        root.mkdir()
+        (root / "asset.txt").write_text("planned")
+        write_deployment_policy(root)
+        source = subject(root)
+
+        write_files(root, {"late.txt": "not part of the frozen plan"})
+
+        with pytest.raises(DeploymentGenerationError, match="'late.txt' was added"):
+            source.apply_to(tmp_path / "destination")
+
+    def test_plan_copy_terminates_generation_when_policy_edited_after_planning(
+        self, subject, tmp_path
+    ):
+        from dallinger.deployment_plan import DeploymentGenerationError
+
+        root = tmp_path / "experiment"
+        root.mkdir()
+        (root / "asset.txt").write_text("planned")
+        (root / "secret.txt").write_text("excluded at plan time")
+        write_deployment_policy(root, ["secret.txt"])
+        source = subject(root)
+
+        write_deployment_policy(root)
+
+        with pytest.raises(DeploymentGenerationError, match="deploy.toml changed"):
+            source.apply_to(tmp_path / "destination")
+
+    def test_plan_copy_does_not_replan_to_pick_up_tree_changes(self, subject, tmp_path):
+        from dallinger.deployment_plan import build_deployment_plan
+
+        root = tmp_path / "experiment"
+        root.mkdir()
+        (root / "asset.txt").write_text("planned")
+        write_deployment_policy(root)
+        source = subject(root)
+        frozen_generation = source.deployment_plan.generation
+
+        (root / "asset.txt").write_text("edited")
+        (root / "other.txt").write_text("new")
+
+        with mock.patch(
+            "dallinger.utils.build_deployment_plan",
+            wraps=build_deployment_plan,
+        ) as builder:
+            with pytest.raises(Exception):  # noqa: B017, PT011
+                source.apply_to(tmp_path / "destination")
+        builder.assert_not_called()
+        assert source.deployment_plan.generation == frozen_generation
+
+    def test_development_symlink_flow_remains_live_for_local_debug(
+        self, subject, tmp_path
+    ):
+        root = tmp_path / "experiment"
+        root.mkdir()
+        (root / "asset.txt").write_text("planned")
+        write_deployment_policy(root)
+        source = subject(root)
+        destination = tmp_path / "develop"
+
+        source.apply_development_to(destination)
+        # Local debug intentionally tracks live sources: editing after the
+        # links are created must not raise a generation error.
+        (root / "asset.txt").write_text("edited live")
+
+        assert (destination / "asset.txt").is_symlink()
+        assert (destination / "asset.txt").read_text() == "edited live"
+
     def test_plan_copy_preserves_mode(self, subject, tmp_path):
         root = tmp_path / "experiment"
         root.mkdir()
@@ -961,6 +1052,183 @@ def test_explicit_provider_rejects_reserved_destinations_before_materialization(
 
     experiment_source.apply_to.assert_not_called()
     assert not destination.exists()
+
+
+def _plan_backed_collation(config, experiment_path, destination, copy_func,
+                           experiment_files=None):
+    experiment_files.apply_to(destination, copy_func=copy_func)
+
+
+def _legacy_collation(config, experiment_path, destination, copy_func,
+                      experiment_files=None):
+    os.makedirs(destination, exist_ok=True)
+    with open(os.path.join(destination, "legacy.txt"), "w") as handle:
+        handle.write("legacy selection")
+
+
+@pytest.mark.usefixtures("active_config")
+def test_assemble_freezes_and_certifies_one_generation_manifest(tmp_path, monkeypatch):
+    from dallinger.deployment_plan import (
+        assembly_manifest_path,
+        read_assembly_manifest,
+        verify_assembly_directory,
+    )
+    from dallinger.utils import ExperimentFileSource, assemble_experiment_temp_dir
+
+    root = tmp_path / "experiment"
+    root.mkdir()
+    write_deployment_policy(root)
+    write_files(root, {"experiment.py": "class E:\n    pass\n"})
+    source = ExperimentFileSource(root)
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("SKIP_DEPENDENCY_CHECK", "1")
+
+    with mock.patch(
+        "dallinger.utils.collate_experiment_files", _plan_backed_collation
+    ):
+        dst = assemble_experiment_temp_dir(
+            mock.Mock(), get_config(), experiment_files=source
+        )
+
+    manifest_path = assembly_manifest_path(dst)
+    assert manifest_path.is_file()
+    manifest = read_assembly_manifest(manifest_path)
+    assert manifest.generation == source.deployment_plan.generation
+    assert "deploy.toml" in {record.destination for record in manifest.files}
+    verify_assembly_directory(dst, manifest)
+
+
+@pytest.mark.usefixtures("active_config")
+def test_assemble_aborts_and_removes_tree_when_frozen_generation_drifts(
+    tmp_path, monkeypatch
+):
+    from dallinger.deployment_plan import DeploymentGenerationError
+    from dallinger.utils import ExperimentFileSource, assemble_experiment_temp_dir
+
+    root = tmp_path / "experiment"
+    root.mkdir()
+    write_deployment_policy(root)
+    (root / "asset.txt").write_text("planned")
+    source = ExperimentFileSource(root)
+    (root / "asset.txt").write_text("edited after planning")
+    private_tree = tmp_path / "private-assembly"
+    private_tree.mkdir()
+    monkeypatch.setattr("dallinger.utils.tempfile.mkdtemp", lambda: str(private_tree))
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("SKIP_DEPENDENCY_CHECK", "1")
+
+    with mock.patch(
+        "dallinger.utils.collate_experiment_files", _plan_backed_collation
+    ):
+        with pytest.raises(DeploymentGenerationError, match="content changed"):
+            assemble_experiment_temp_dir(
+                mock.Mock(), get_config(), experiment_files=source
+            )
+
+    # The failed generation leaves no partial isolated tree behind.
+    assert not private_tree.exists()
+
+
+@pytest.mark.usefixtures("active_config")
+def test_setup_experiment_certifies_snapshot_zip_against_generation(
+    tmp_path, monkeypatch
+):
+    from dallinger.deployment import setup_experiment
+    from dallinger.utils import ExperimentFileSource
+    from dallinger.deployment_plan import (
+        assembly_manifest_path,
+        read_assembly_manifest,
+        verify_zip_archive,
+    )
+
+    root = tmp_path / "experiment"
+    root.mkdir()
+    write_deployment_policy(root)
+    write_files(root, {"experiment.py": "class E:\n    pass\n"})
+    source = ExperimentFileSource(root)
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("SKIP_DEPENDENCY_CHECK", "1")
+
+    with mock.patch(
+        "dallinger.utils.collate_experiment_files", _plan_backed_collation
+    ):
+        exp_id, dst = setup_experiment(
+            log=mock.Mock(),
+            debug=False,
+            local_checks=False,
+            experiment_files=source,
+        )
+
+    manifest = read_assembly_manifest(assembly_manifest_path(dst))
+    archive = root / "snapshots" / f"{exp_id}-code.zip"
+    assert archive.is_file()
+    verify_zip_archive(archive, manifest)
+
+
+@pytest.mark.usefixtures("active_config")
+def test_setup_experiment_rejects_zip_drift_from_tampered_snapshot(
+    tmp_path, monkeypatch
+):
+    import zipfile
+
+    from dallinger.deployment import setup_experiment
+    from dallinger.utils import ExperimentFileSource
+    from dallinger.deployment_plan import DeploymentGenerationError
+
+    root = tmp_path / "experiment"
+    root.mkdir()
+    write_deployment_policy(root)
+    write_files(root, {"experiment.py": "class E:\n    pass\n"})
+    source = ExperimentFileSource(root)
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("SKIP_DEPENDENCY_CHECK", "1")
+    real_make_archive = shutil.make_archive
+
+    def tampered_make_archive(base_name, format, root_dir, *args, **kwargs):
+        archive_path = real_make_archive(base_name, format, root_dir, *args, **kwargs)
+        with zipfile.ZipFile(archive_path, "a") as bundle:
+            bundle.writestr("rogue-mixed-generation.txt", "sneaked in")
+        return archive_path
+
+    with (
+        mock.patch(
+            "dallinger.utils.collate_experiment_files", _plan_backed_collation
+        ),
+        mock.patch(
+            "dallinger.utils.shutil.make_archive", side_effect=tampered_make_archive
+        ),
+    ):
+        with pytest.raises(DeploymentGenerationError, match="rogue"):
+            setup_experiment(
+                log=mock.Mock(),
+                debug=False,
+                local_checks=False,
+                experiment_files=source,
+            )
+
+
+@pytest.mark.usefixtures("active_config")
+def test_legacy_assembly_without_policy_has_no_generation_manifest(
+    tmp_path, monkeypatch
+):
+    from dallinger.deployment_plan import assembly_manifest_path
+    from dallinger.utils import ExperimentFileSource, assemble_experiment_temp_dir
+
+    root = tmp_path / "experiment"
+    root.mkdir()
+    write_files(root, {"experiment.py": "class E:\n    pass\n"})
+    source = ExperimentFileSource(root)
+    assert source.deployment_plan is None
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("SKIP_DEPENDENCY_CHECK", "1")
+
+    with mock.patch("dallinger.utils.collate_experiment_files", _legacy_collation):
+        dst = assemble_experiment_temp_dir(
+            mock.Mock(), get_config(), experiment_files=source
+        )
+
+    assert not assembly_manifest_path(dst).exists()
+    assert (Path(dst) / "legacy.txt").is_file()
 
 
 @pytest.mark.usefixtures("bartlett_dir", "active_config", "reset_sys_modules")

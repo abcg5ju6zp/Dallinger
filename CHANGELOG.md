@@ -4,6 +4,24 @@
 
 ### Added
 
+- A `deploy.toml` deployment now freezes one auditable input generation.
+  The plan records a SHA-256 digest for every selected file plus a
+  generation identity over the policy, destinations, digests, and modes;
+  the size shown by `dallinger deployment-files list` is the size of that
+  frozen generation. Materialization re-checks the working tree and streams
+  each source through its frozen digest while copying, so editing source,
+  `deploy.toml`, or dependency materials after a deployment starts (or a
+  file being replaced, deleted, turned into a different type, or newly
+  selected) terminates the generation before any archive or image is
+  published instead of mixing two versions. The fully assembled isolated
+  tree is fingerprinted into a generation manifest; the snapshot zip and
+  the Docker build context are re-verified against it (only the generated
+  `Dockerfile` and local-debug Compose files are allowed framework
+  overlays), and built images carry an
+  `org.dallinger.deployment-generation` label. An older image found under
+  a generation tag is rebuilt rather than silently reused. Deployments
+  without `deploy.toml`, unchanged trees, provider overrides, and live
+  local-debug symlink flows are unchanged.
 - Added a `jquery` block inside the `libs` block of `base/layout.html`.
   Templates that already load jQuery in `<head>` can override it with an
   empty block instead of loading jQuery a second time, which replaced the

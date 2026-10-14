@@ -31,9 +31,27 @@ def test_list_emits_sorted_destinations_and_summary(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     lines = result.output.strip().splitlines()
-    assert lines[:-1] == ["a.txt", "deploy.toml", "m/n.txt"]
-    assert "3 files" in lines[-1]
+    assert lines[:-2] == ["a.txt", "deploy.toml", "m/n.txt"]
+    assert "3 files" in lines[-2]
+    assert re.fullmatch(r"Generation: [0-9a-f]{64}", lines[-1])
     assert "manifest" not in result.output
+
+
+def test_list_json_reports_the_frozen_generation_identity(tmp_path, monkeypatch):
+    from dallinger.deployment_plan import build_deployment_plan
+
+    write_deployment_policy(tmp_path, ["local"])
+    write_files(tmp_path, {"asset.txt": "x"})
+    monkeypatch.chdir(tmp_path)
+    expected_generation = build_deployment_plan(tmp_path).generation
+
+    result = CliRunner().invoke(deployment_files, ["list", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["destinations"] == ["asset.txt", "deploy.toml"]
+    assert payload["generation"] == expected_generation
+    assert re.fullmatch(r"[0-9a-f]{64}", payload["generation"])
 
 
 def test_list_json_omits_manifest_digest(tmp_path, monkeypatch):

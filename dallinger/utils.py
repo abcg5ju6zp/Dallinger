@@ -35,9 +35,16 @@ from dallinger.deployment_plan import (
     POLICY_FILENAME,
     DeploymentPlan,
     DeploymentPlanError,
+    assembly_manifest_path,
+    build_assembly_manifest,
     build_deployment_plan,
     materialize_deployment_plan_entry,
+    read_assembly_manifest,
     validate_explicit_provider_destination,
+    verify_assembly_directory,
+    verify_plan_sources,
+    verify_zip_archive,
+    write_assembly_manifest,
 )
 from dallinger.models import Participant
 
@@ -644,14 +651,24 @@ def setup_experiment(
     )
     log("Deployment temp directory: {}".format(temp_dir), chevrons=False)
 
+    # The isolated assembly is the auditable artifact for this generation.
+    # Recheck it before it becomes an archive or a Docker build context.
+    manifest = _load_assembly_manifest_if_present(temp_dir)
+    if manifest is not None:
+        verify_assembly_directory(temp_dir, manifest)
+
     # Zip up the temporary directory and place it in the cwd.
     if not debug:
         log("Freezing the experiment package...")
-        shutil.make_archive(
+        archive_path = shutil.make_archive(
             os.path.join(os.getcwd(), "snapshots", heroku_app_id + "-code"),
             "zip",
             temp_dir,
         )
+        if manifest is not None:
+            # The publishable snapshot must contain exactly the frozen
+            # generation, even if another process touched shared storage.
+            verify_zip_archive(archive_path, manifest)
 
     return (heroku_app_id, temp_dir)
 
@@ -680,13 +697,14 @@ def assemble_experiment_temp_dir(log, config, for_remote=False, experiment_files
     exp_id = config.get("id")
     private_tree = tempfile.mkdtemp()
     dst = os.path.join(private_tree, exp_id)
+    file_source = experiment_files or ExperimentFileSource(os.getcwd())
     try:
         collate_experiment_files(
             config,
             experiment_path=os.getcwd(),
             destination=dst,
             copy_func=copy_file,
-            experiment_files=experiment_files,
+            experiment_files=file_source,
         )
 
         # Write out the loaded configuration
@@ -748,10 +766,34 @@ def assemble_experiment_temp_dir(log, config, for_remote=False, experiment_files
                             requirements_path.read_text(), egg_name
                         )
                     )
+
+        if file_source.deployment_plan is not None:
+            # Freeze the complete isolated artifact (planned sources,
+            # generated configuration and dependency materials, provider
+            # overlays, and any staged local wheel) under one content
+            # generation. Archives and Docker contexts are rechecked against
+            # this manifest before they can be published.
+            manifest = build_assembly_manifest(
+                dst,
+                generation=file_source.deployment_plan.generation,
+            )
+            write_assembly_manifest(manifest, assembly_manifest_path(dst))
     except BaseException:
         shutil.rmtree(private_tree, ignore_errors=True)
         raise
     return dst
+
+
+def _load_assembly_manifest_if_present(staging_directory):
+    """Return a frozen assembly manifest next to an assembly, or ``None``.
+
+    Legacy assemblies (no ``deploy.toml`` plan) have no manifest and keep
+    their historical behavior.
+    """
+    manifest_path = assembly_manifest_path(staging_directory)
+    if not manifest_path.is_file():
+        return None
+    return read_assembly_manifest(manifest_path)
 
 
 _AUTHORED_ROOT_INPUTS = ("requirements.txt",)
@@ -982,6 +1024,12 @@ class ExperimentFileSource(FileSource):
             raise ValueError(
                 "Plan-backed experiment files require copy_file or symlink_file."
             )
+
+        if copy_func is copy_file:
+            # Fail closed before reading any source: a replacement, deletion,
+            # type change, mode change, or newly selected file would otherwise
+            # mix two generations into one publishable assembly.
+            verify_plan_sources(self.deployment_plan)
 
         for entry in self.deployment_plan.entries:
             target = os.path.join(destination, *entry.destination.split("/"))

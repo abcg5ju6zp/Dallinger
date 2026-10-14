@@ -12,6 +12,12 @@ from packaging.version import InvalidVersion, Version
 from pip._internal.network.session import PipSession
 from pip._internal.req import parse_requirements
 
+from dallinger.deployment_plan import (
+    GENERATION_LABEL,
+    assembly_manifest_path,
+    read_assembly_manifest,
+    verify_assembly_directory,
+)
 from dallinger.docker.wheel_filename import parse_wheel_filename
 from dallinger.utils import (
     JSON_LOGFILE,
@@ -361,16 +367,30 @@ def build_image(
     If ``image_tag`` is set, use it (deploy: per-launch UID). Otherwise hash
     ``requirements.txt`` and ``prepare_docker_image.sh``. If
     ``force_build`` is False, skip the build when that tag already exists.
+
+    When the assembly carries a frozen generation manifest, the build context
+    is rechecked against it (allowing only declared framework overlays) and
+    the image is labelled with the generation. An older image found under the
+    same tag is rebuilt rather than silently accepted as this generation.
     """
     tag = image_tag or get_experiment_image_tag(tmp_dir)
     image_name = f"{base_image_name}:{tag}"
     base_image_name = get_base_image(tmp_dir, needs_chrome)
+    manifest = _load_generation_manifest(tmp_dir)
     client = docker.client.from_env()
     try:
-        client.api.inspect_image(image_name)
+        image_attrs = client.api.inspect_image(image_name)
         out.blather(f"Image {image_name} found\n")
         if not force_build:
-            return image_name
+            if manifest is not None and not image_generation_matches(
+                image_attrs, manifest.generation
+            ):
+                out.blather(
+                    f"Image {image_name} belongs to an older deployment "
+                    "generation; rebuilding instead of reusing it.\n"
+                )
+            else:
+                return image_name
         out.blather("Rebuilding\n")
     except docker.errors.ImageNotFound:
         out.blather(f"Image {image_name} not found - building\n")
@@ -452,9 +472,55 @@ def build_image(
         CMD dallinger_heroku_web
         """
         dockerfile_path.write_text(ensure_experiment_workdir_writable(dockerfile_text))
+    if manifest is not None:
+        # Certify what the Docker daemon will actually receive as the build
+        # context against the frozen generation. Only framework-owned files
+        # legitimately added after assembly are permitted as overlays.
+        verify_assembly_directory(
+            tmp_dir,
+            manifest,
+            allow=_FRAMEWORK_CONTEXT_OVERLAYS,
+        )
+        docker_build_invocation += [
+            "--label",
+            f"{GENERATION_LABEL}={manifest.generation}",
+        ]
     try:
         check_output(docker_build_invocation, env=env)
     except CalledProcessError:
         raise BuildError
     out.blather(f"Built image: {image_name}" + "\n")
     return image_name
+
+
+# Root-relative files the framework may add to an assembly after it was frozen
+# but before it becomes a Docker build context. Nothing else may appear.
+_FRAMEWORK_CONTEXT_OVERLAYS = frozenset(
+    {
+        "Dockerfile",
+        "docker-compose.yml",
+        ".env",
+        JSON_LOGFILE,
+    }
+)
+
+
+def _load_generation_manifest(tmp_dir):
+    """Load the frozen assembly manifest next to a staging dir, if present."""
+    manifest_path = assembly_manifest_path(tmp_dir)
+    if not manifest_path.is_file():
+        return None
+    return read_assembly_manifest(manifest_path)
+
+
+def image_generation_matches(image_attrs, generation):
+    """Return whether a built image carries the given frozen generation.
+
+    Late or retried build results are accepted only when their label matches
+    the generation currently being deployed.
+    """
+    if not isinstance(image_attrs, dict):
+        return False
+    config_section = image_attrs.get("Config") or {}
+    labels = config_section.get("Labels") or {}
+    return labels.get(GENERATION_LABEL) == generation

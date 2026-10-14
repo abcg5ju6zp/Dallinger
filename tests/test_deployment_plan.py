@@ -1,11 +1,15 @@
+import json
 import os
 import re
+import shutil
 import unicodedata
+import zipfile
 
 import pytest
 
 import dallinger.deployment_plan as deployment_plan
 from dallinger.deployment_plan import (
+    DeploymentGenerationError,
     DeploymentPlanError,
     DeploymentPolicyError,
     build_deployment_plan,
@@ -496,3 +500,329 @@ def test_exclusion_lookup_checks_ancestors():
     assert not deployment_plan._is_excluded(("static", "public", "x"), exclusions)
     assert deployment_plan._has_exclusion_at_or_below(("static",), exclusions)
     assert not deployment_plan._has_exclusion_at_or_below(("other",), exclusions)
+
+
+def _entry(plan, destination):
+    return next(item for item in plan.entries if item.destination == destination)
+
+
+def test_plan_entries_record_sha256_content_digests(tmp_path):
+    import hashlib
+
+    write_deployment_policy(tmp_path)
+    write_files(tmp_path, {"a.txt": "abc"})
+
+    plan = build_deployment_plan(tmp_path)
+    entry = _entry(plan, "a.txt")
+
+    assert entry.digest == "sha256:" + hashlib.sha256(b"abc").hexdigest()
+    assert plan.policy_digest == _entry(plan, "deploy.toml").digest
+    assert re.fullmatch(r"[0-9a-f]{64}", plan.generation)
+
+
+def test_plan_generation_is_identical_for_identical_trees(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    for root in (first, second):
+        root.mkdir()
+        write_deployment_policy(root)
+        write_files(root, {"a.txt": "a", "m/n.txt": "n", "run.sh": "#!/bin/sh\n"})
+        (root / "run.sh").chmod(0o755)
+
+    assert build_deployment_plan(first).generation == (
+        build_deployment_plan(second).generation
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda root: (root / "a.txt").write_text("changed"), id="content"),
+        pytest.param(lambda root: (root / "run.sh").chmod(0o700), id="mode"),
+        pytest.param(lambda root: write_files(root, {"new.txt": "new"}), id="added"),
+        pytest.param(lambda root: (root / "a.txt").unlink(), id="deleted"),
+    ],
+)
+def test_plan_generation_changes_with_any_input_drift(tmp_path, mutate):
+    write_deployment_policy(tmp_path)
+    write_files(tmp_path, {"a.txt": "a"})
+    run_script = tmp_path / "run.sh"
+    run_script.write_text("#!/bin/sh\n")
+    run_script.chmod(0o755)
+    before = build_deployment_plan(tmp_path).generation
+
+    mutate(tmp_path)
+
+    assert build_deployment_plan(tmp_path).generation != before
+
+
+def test_plan_generation_changes_when_policy_changes(tmp_path):
+    write_deployment_policy(tmp_path)
+    write_files(tmp_path, {"a.txt": "a"})
+    before = build_deployment_plan(tmp_path).generation
+
+    write_deployment_policy(tmp_path, ["a.txt"])
+
+    assert build_deployment_plan(tmp_path).generation != before
+
+
+def test_verify_plan_sources_accepts_unchanged_tree(tmp_path):
+    write_deployment_policy(tmp_path)
+    write_files(tmp_path, {"a.txt": "a", "d/b.txt": "b"})
+    plan = build_deployment_plan(tmp_path)
+
+    deployment_plan.verify_plan_sources(plan)
+
+
+@pytest.mark.parametrize(
+    "mutate, fragment",
+    [
+        pytest.param(
+            lambda root: (root / "a.txt").write_text("changed"),
+            "content changed",
+            id="content",
+        ),
+        pytest.param(
+            lambda root: (root / "a.txt").unlink(),
+            "deleted",
+            id="deleted",
+        ),
+        pytest.param(
+            lambda root: write_files(root, {"new.txt": "new"}),
+            "added",
+            id="added",
+        ),
+        pytest.param(
+            lambda root: (root / "run.sh").chmod(0o700),
+            "permissions",
+            id="mode",
+        ),
+    ],
+)
+def test_verify_plan_sources_rejects_drift(tmp_path, mutate, fragment):
+    write_deployment_policy(tmp_path)
+    write_files(tmp_path, {"a.txt": "a"})
+    run_script = tmp_path / "run.sh"
+    run_script.write_text("#!/bin/sh\n")
+    run_script.chmod(0o755)
+    plan = build_deployment_plan(tmp_path)
+
+    mutate(tmp_path)
+
+    with pytest.raises(DeploymentGenerationError, match=fragment):
+        deployment_plan.verify_plan_sources(plan)
+
+
+def test_verify_plan_sources_rejects_file_to_directory_swap(tmp_path):
+    write_deployment_policy(tmp_path)
+    target = tmp_path / "a.txt"
+    target.write_text("a")
+    plan = build_deployment_plan(tmp_path)
+
+    target.unlink()
+    (target / "child.txt").parent.mkdir()
+    target.joinpath("child.txt").write_text("inside")
+
+    with pytest.raises(DeploymentGenerationError, match="directory"):
+        deployment_plan.verify_plan_sources(plan)
+
+
+def test_verify_plan_sources_rejects_symlink_replacement(tmp_path):
+    write_deployment_policy(tmp_path)
+    target = tmp_path / "a.txt"
+    target.write_text("a")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside")
+    plan = build_deployment_plan(tmp_path)
+
+    target.unlink()
+    target.symlink_to(outside)
+
+    with pytest.raises(DeploymentGenerationError, match="not a regular file"):
+        deployment_plan.verify_plan_sources(plan)
+
+
+def test_verify_plan_sources_rejects_policy_edits(tmp_path):
+    write_deployment_policy(tmp_path)
+    write_files(tmp_path, {"a.txt": "a"})
+    plan = build_deployment_plan(tmp_path)
+
+    write_deployment_policy(tmp_path, ["a.txt"])
+
+    with pytest.raises(DeploymentGenerationError, match="deploy.toml changed"):
+        deployment_plan.verify_plan_sources(plan)
+
+
+def test_materialization_streams_exactly_the_frozen_digest(tmp_path):
+    write_deployment_policy(tmp_path)
+    write_files(tmp_path, {"a.txt": "planned"})
+    plan = build_deployment_plan(tmp_path)
+    target = tmp_path / "out" / "a.txt"
+
+    deployment_plan.materialize_deployment_plan_entry(
+        plan, _entry(plan, "a.txt"), target
+    )
+
+    assert target.read_text() == "planned"
+
+
+def test_materialization_rejects_content_changed_after_planning(tmp_path):
+    write_deployment_policy(tmp_path)
+    source = tmp_path / "a.txt"
+    source.write_text("planned")
+    plan = build_deployment_plan(tmp_path)
+    target = tmp_path / "out" / "a.txt"
+
+    source.write_text("rewritten after planning")
+
+    with pytest.raises(DeploymentGenerationError, match="content digest differs"):
+        deployment_plan.materialize_deployment_plan_entry(
+            plan, _entry(plan, "a.txt"), target
+        )
+    assert not target.exists()
+
+
+def test_assembly_manifest_roundtrips_and_is_self_checking(tmp_path):
+    staging = tmp_path / "assembly"
+    write_files(staging, {"a.txt": "a", "bin/run.sh": "#!/bin/sh\n"})
+    (staging / "bin" / "run.sh").chmod(0o755)
+    manifest = deployment_plan.build_assembly_manifest(staging, generation="gen-1")
+
+    text = manifest.to_json()
+    assert manifest == deployment_plan.AssemblyManifest.from_json(text)
+    assert "gen-1" in text
+    assert manifest.root_digest.startswith("sha256:")
+
+    payload = json.loads(text)
+    payload["files"][0]["digest"] = "sha256:" + "0" * 64
+    with pytest.raises(DeploymentPlanError, match="root digest"):
+        deployment_plan.AssemblyManifest.from_json(json.dumps(payload))
+
+
+def test_assembly_manifest_path_sits_next_to_the_staging_tree(tmp_path):
+    staging = tmp_path / "private" / "exp-uid"
+    staging.mkdir(parents=True)
+
+    assert deployment_plan.assembly_manifest_path(staging) == (
+        tmp_path / "private" / deployment_plan.ASSEMBLY_MANIFEST_NAME
+    )
+
+
+def test_verify_assembly_directory_accepts_frozen_tree_and_declared_overlays(tmp_path):
+    staging = tmp_path / "assembly"
+    write_files(staging, {"a.txt": "a"})
+    manifest = deployment_plan.build_assembly_manifest(staging, generation="gen-1")
+
+    deployment_plan.verify_assembly_directory(staging, manifest)
+
+    write_files(staging, {"Dockerfile": "FROM scratch\n"})
+    with pytest.raises(DeploymentGenerationError, match="Dockerfile"):
+        deployment_plan.verify_assembly_directory(staging, manifest)
+
+    deployment_plan.verify_assembly_directory(staging, manifest, allow=("Dockerfile",))
+
+
+def test_verify_assembly_directory_allows_declared_rewrite_of_frozen_file(tmp_path):
+    staging = tmp_path / "assembly"
+    write_files(staging, {"a.txt": "a", "Dockerfile": "FROM base:1\n"})
+    manifest = deployment_plan.build_assembly_manifest(staging, generation="gen-1")
+
+    # The framework rewrites a frozen destination after the freeze.
+    (staging / "Dockerfile").write_text("FROM base:2\n# rewritten by framework\n")
+
+    with pytest.raises(DeploymentGenerationError, match="Dockerfile"):
+        deployment_plan.verify_assembly_directory(staging, manifest)
+    deployment_plan.verify_assembly_directory(staging, manifest, allow=("Dockerfile",))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda staging: (staging / "a.txt").write_text("changed"), id="content"
+        ),
+        pytest.param(lambda staging: (staging / "a.txt").unlink(), id="deleted"),
+        pytest.param(
+            lambda staging: write_files(staging, {"extra.txt": "extra"}), id="added"
+        ),
+        pytest.param(lambda staging: (staging / "a.txt").chmod(0o600), id="mode"),
+    ],
+)
+def test_verify_assembly_directory_rejects_drift(tmp_path, mutate):
+    staging = tmp_path / "assembly"
+    write_files(staging, {"a.txt": "a", "keep.sh": "#!/bin/sh\n"})
+    (staging / "keep.sh").chmod(0o755)
+    manifest = deployment_plan.build_assembly_manifest(staging, generation="gen-1")
+
+    mutate(staging)
+
+    with pytest.raises(DeploymentGenerationError):
+        deployment_plan.verify_assembly_directory(staging, manifest)
+
+
+def test_verify_assembly_directory_rejects_symlink_in_isolated_tree(tmp_path):
+    staging = tmp_path / "assembly"
+    write_files(staging, {"a.txt": "a"})
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside")
+    manifest = deployment_plan.build_assembly_manifest(staging, generation="gen-1")
+
+    (staging / "link.txt").symlink_to(outside)
+
+    with pytest.raises(DeploymentPlanError, match="non-regular file"):
+        deployment_plan.verify_assembly_directory(staging, manifest)
+
+
+def _make_zip(root, base_name):
+    return shutil.make_archive(str(base_name), "zip", root.parent, root.name)
+
+
+def test_verify_zip_archive_members_match_manifest(tmp_path):
+    staging = tmp_path / "assembly"
+    write_files(staging, {"a.txt": "a", "d/b.txt": "b"})
+    manifest = deployment_plan.build_assembly_manifest(staging, generation="gen-1")
+    archive = _make_zip(staging, tmp_path / "bundle")
+
+    deployment_plan.verify_zip_archive(archive, manifest)
+
+
+def test_verify_zip_archive_strips_shared_root_directory(tmp_path):
+    staging = tmp_path / "assembly"
+    write_files(staging, {"a.txt": "a"})
+    manifest = deployment_plan.build_assembly_manifest(staging, generation="gen-1")
+    bundle = tmp_path / "prefixed.zip"
+    with zipfile.ZipFile(bundle, "w") as archive:
+        archive.writestr("exp-uid/a.txt", "a")
+
+    deployment_plan.verify_zip_archive(bundle, manifest)
+
+
+def test_verify_zip_archive_rejects_added_changed_and_missing_members(tmp_path):
+    staging = tmp_path / "assembly"
+    write_files(staging, {"a.txt": "a", "d/b.txt": "b"})
+    manifest = deployment_plan.build_assembly_manifest(staging, generation="gen-1")
+
+    extra = tmp_path / "extra.zip"
+    with zipfile.ZipFile(extra, "w") as archive:
+        archive.writestr("a.txt", "a")
+        archive.writestr("d/b.txt", "b")
+        archive.writestr("rogue.txt", "sneaked in")
+    with pytest.raises(DeploymentGenerationError, match="rogue.txt"):
+        deployment_plan.verify_zip_archive(extra, manifest)
+
+    changed = tmp_path / "changed.zip"
+    with zipfile.ZipFile(changed, "w") as archive:
+        archive.writestr("a.txt", "different bytes")
+        archive.writestr("d/b.txt", "b")
+    with pytest.raises(DeploymentGenerationError, match="a.txt"):
+        deployment_plan.verify_zip_archive(changed, manifest)
+
+    missing = tmp_path / "missing.zip"
+    with zipfile.ZipFile(missing, "w") as archive:
+        archive.writestr("a.txt", "a")
+    with pytest.raises(DeploymentGenerationError, match="b.txt.*missing"):
+        deployment_plan.verify_zip_archive(missing, manifest)
+
+
+def test_generation_label_is_a_stable_docker_label_name():
+    assert deployment_plan.GENERATION_LABEL == "org.dallinger.deployment-generation"
