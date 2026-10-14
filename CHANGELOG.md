@@ -114,6 +114,21 @@
 
 ### Fixed
 
+- Exports taken while participants are still writing are now point-in-time
+  consistent: every table is copied through one read-only, deferrable
+  serializable transaction, and each export runs as an isolated *generation*
+  that binds the table data, experiment id, code snapshot and anonymization
+  result together. The local archive is built and verified in a staging
+  directory and published atomically, and the S3 object and registered URL
+  are only written afterwards. A failed table copy leaves no publishable
+  file; anonymization or code-snapshot failures keep the stage for diagnosis
+  without registering a half-finished archive; a failed URL registration
+  retries the same uploaded object instead of re-exporting, and older
+  attempts can no longer overwrite a newer generation's object or URL.
+  Restarts and duplicate requests clean up orphaned temporary directories
+  and resume still-complete stages. The archive layout, local exports,
+  exports without anonymization, and exports after an experiment has stopped
+  are unchanged.
 - Bots with a ``webdriver_url`` start again. They passed
   ``desired_capabilities``, which Selenium 4.10 removed, and now pass the
   same browser options as local bots.
