@@ -75,6 +75,18 @@
   A custom experiment Dockerfile gets a final step that installs that wheel.
   Dallinger pins given as Git URLs are replaced by the local wheel as well
   (extras such as ``[docker]`` are dropped from the rewritten line).
+- Experiment replays now run in isolated replay generations
+  (``dallinger.replay.ReplayGeneration``). Each Notebook
+  ``restore_state_from_replay`` session and each server-side
+  ``ReplayBackend`` run gets a unique id and its own temporary import
+  database, import session, configuration override and progress cursor. The
+  export package is validated before anything is imported, resources are
+  registered next, and ``replay_start`` is only published after the
+  configuration overrides are applied. Events are confirmed one at a time,
+  and ``replay_finish`` is only committed when every event and user hook
+  succeeds. A process-wide registry converges older generations when a
+  Notebook cell is re-executed, and concurrent replays no longer share an
+  ``app_id`` or global state.
 
 ### Changed
 
@@ -114,6 +126,18 @@
 
 ### Fixed
 
+- A failed experiment replay no longer leaks into the next one. If importing
+  the dataset, replaying an event or running a user hook raised, the old
+  ``restore_state_from_replay`` cleanup could be skipped, leaving the
+  temporary ``*-import-*`` database, its sessions, the global
+  ``dallinger_experiment`` module alias and the configuration override in
+  place. Teardown is now idempotent and always runs: a failed import deletes
+  its unpublished database, an event or hook failure rolls back the main
+  session while keeping the failing event's position for diagnostics, and a
+  re-entered cleanup (including a restart or a re-run Notebook cell) only
+  closes sessions, restores the global module and configuration and drops
+  temporary resources -- it never replays already confirmed events.
+  Successful replays now drop their temporary import database too.
 - Bots with a ``webdriver_url`` start again. They passed
   ``desired_capabilities``, which Selenium 4.10 removed, and now pass the
   same browser options as local bots.

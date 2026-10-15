@@ -19,8 +19,8 @@ from typing import Any, List, Optional, Union
 
 import requests
 from flask import Blueprint, url_for
-from sqlalchemy import String, Table, and_, asc, cast, create_engine, desc, func, or_
-from sqlalchemy.orm import scoped_session, sessionmaker, undefer
+from sqlalchemy import String, Table, and_, asc, cast, desc, func, or_
+from sqlalchemy.orm import undefer
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.orm.exc import MultipleResultsFound, NoResultFound
 
@@ -35,17 +35,13 @@ from dallinger.config import (
 from dallinger.data import (
     Data,
     export,
-    find_experiment_export,
-    ingest_zip,
     is_registered,
 )
 from dallinger.data import load as data_load
 from dallinger.db import (
     Base,
-    db_url,
     get_mapped_class,
     get_polymorphic_mapping,
-    init_db,
 )
 from dallinger.experiment_server.utils import date_handler
 from dallinger.heroku.tools import HerokuApp
@@ -1946,75 +1942,30 @@ class Experiment:
     def restore_state_from_replay(
         self, app_id, session=None, zip_path=None, **configuration_options
     ):
-        # We need to fake dallinger_experiment to point at the current experiment
-        module = sys.modules[type(self).__module__]
-        if sys.modules.get("dallinger_experiment", module) != module:
-            logger.warning("dallinger_experiment is already set, updating")
-        sys.modules["dallinger_experiment"] = module
+        """Restore an experiment's state from an exported dataset for replay.
 
-        # Load the configuration
-        config = get_config(load=True)
+        Each call opens an isolated
+        :class:`~dallinger.replay.ReplayGeneration`: the export package is
+        validated before anything is imported, the temporary database and
+        import session are registered, the configuration options are applied
+        and only then is ``replay_start`` published. All teardown -- closing
+        sessions, restoring the global ``dallinger_experiment`` module and
+        configuration and dropping the temporary database -- runs even when
+        import, event replay or a user hook raises. Re-entering teardown only
+        converges resources; it never replays confirmed events.
+        """
+        from dallinger.replay import ReplayGeneration
 
-        self.app_id = self.original_app_id = app_id
-        self.exp_config = config
-
-        # The replay index is initialised to 1970 as that is guaranteed
-        # to be before any experiment Info objects
-        self._replay_time_index = datetime.datetime(1970, 1, 1, 1, 1, 1)
-
-        # Create a second database session so we can load the full history
-        # of the experiment to be replayed and selectively import events
-        # into the main database
-        specific_db_url = db_url + "-import-" + app_id
-        import_engine = create_engine(specific_db_url)
-        try:
-            # Clear the temporary storage and import it
-            init_db(drop_all=True, bind=import_engine)
-        except Exception:
-            create_db_engine = create_engine(db_url)
-            conn = create_db_engine.connect()
-            conn.execute("COMMIT;")
-            conn.execute(
-                'CREATE DATABASE "{}"'.format(specific_db_url.rsplit("/", 1)[1])
-            )
-            conn.close()
-            import_engine = create_engine(specific_db_url)
-            init_db(drop_all=True, bind=import_engine)
-
-        self.import_session = scoped_session(
-            sessionmaker(autocommit=False, autoflush=True, bind=import_engine)
+        generation = ReplayGeneration(
+            self,
+            app_id,
+            zip_path=zip_path,
+            configuration_options=configuration_options,
         )
-
-        # Find the real data for this experiment
-        if zip_path is None:
-            zip_path = find_experiment_export(app_id)
-        if zip_path is None:
-            msg = 'Dataset export for app id "{}" could not be found.'
-            raise IOError(msg.format(app_id))
-
-        print("Ingesting dataset from {}...".format(os.path.basename(zip_path)))
-        ingest_zip(zip_path, engine=import_engine)
-        self._replay_range = tuple(
-            self.import_session.query(
-                func.min(Info.creation_time), func.max(Info.creation_time)
+        with generation:
+            yield Scrubber(
+                self, session=self.import_session, generation=generation
             )
-        )[0]
-        # We apply the configuration options we were given and yield
-        # the scrubber function into the context manager, so within the
-        # with experiment.restore_state_from_replay(...): block the configuration
-        # options are correctly set
-        with config.override(configuration_options, strict=True):
-            self.replay_start()
-            yield Scrubber(self, session=self.import_session)
-            self.replay_finish()
-
-        # Clear up global state
-        self.import_session.rollback()
-        self.import_session.close()
-        db.session.rollback()
-        db.session.close()
-        config._reset(register_defaults=True)
-        del sys.modules["dallinger_experiment"]
 
     def revert_to_time(self, session, target):
         # We do not support going back in time
@@ -2052,16 +2003,25 @@ class Experiment:
         # re-run as there doesn't seem to be a cleanup hook for widgets
         # displayed as part of a cell that is being re-rendered
 
+        cleaned_up = False
+
         def _jupyter_cleanup():
+            # Converge this generation exactly once: re-running the cell
+            # only tears down the previous replay, it never re-enters it.
+            nonlocal cleaned_up
+            if cleaned_up:
+                return
+            cleaned_up = True
             replay.__exit__(None, None, None)
 
         sys.modules["dallinger_experiment"]._jupyter_cleanup = _jupyter_cleanup
 
 
 class Scrubber:
-    def __init__(self, experiment, session):
+    def __init__(self, experiment, session, generation=None):
         self.experiment = experiment
         self.session = session
+        self.generation = generation
         self.realtime = False
 
     def __call__(self, time):
@@ -2079,7 +2039,18 @@ class Scrubber:
             if event.creation_time > time:
                 # Stop once we get future events
                 break
-            self.experiment.replay_event(event)
+            try:
+                self.experiment.replay_event(event)
+            except Exception as exc:
+                if self.generation is not None:
+                    # Roll back the main session and preserve the diagnostic
+                    # position before the failure escapes the scrubber.
+                    self.generation.record_failure(
+                        "event", event=event, exc=exc
+                    )
+                raise
+            if self.generation is not None:
+                self.generation.confirm(event)
             self.experiment._replay_time_index = event.creation_time
         # Override app_id to allow exports to be created that don't
         # overwrite the original dataset
